@@ -13,6 +13,7 @@ import {
   useReactFlow,
   type Edge,
   type Node,
+  type OnNodeDrag,
   type NodeMouseHandler,
 } from '@xyflow/react';
 import {
@@ -20,21 +21,25 @@ import {
   ArrowUpRight,
   Check,
   ChevronsLeft,
+  Clock3,
   FileCode2,
-  Focus,
   Github,
+  House,
   Info,
+  Layers3,
+  Network,
   PanelRightClose,
   PanelRightOpen,
+  Ruler,
   RotateCcw,
   Search,
+  SlidersHorizontal,
   Upload,
   X,
 } from 'lucide-react';
 import BuildingNode, { type BuildingNodeData } from './BuildingNode';
 import {
   compactUri,
-  connectedIds,
   deriveVisible,
   expansionAfterClick,
   expansionConnectedIds,
@@ -43,15 +48,31 @@ import {
   localName,
   parseTurtle,
   prettify,
-  propertySetConnectionIds,
+  propertyEntriesFor,
+  quadLinkCategory,
   resourceKind,
   type GraphModel,
+  type LinkFilter,
 } from './graph';
 import { SAMPLE_TURTLE } from './sample';
 
 const NODE_WIDTH = 248;
 const NODE_HEIGHT = 76;
+const PROPERTY_SET_HEIGHT = 224;
 const nodeTypes = { building: BuildingNode };
+const LINK_FILTERS: { id: LinkFilter; label: string; description: string; icon: typeof Layers3 }[] = [
+  { id: 'all', label: 'All relations', description: 'Complete linked view', icon: Layers3 },
+  { id: 'topology', label: 'Spatial topology', description: 'Building structure & adjacency', icon: Network },
+  { id: 'geometry', label: 'Geometry', description: 'Shapes & representations', icon: Ruler },
+  { id: 'properties', label: 'Properties', description: 'Property sets & metadata', icon: SlidersHorizontal },
+];
+
+const EDGE_COLORS = {
+  topology: '#477465',
+  geometry: '#9a6848',
+  properties: '#6d6a94',
+  other: '#8f938d',
+};
 
 function layoutGraph(
   nodes: Node[],
@@ -61,12 +82,13 @@ function layoutGraph(
 ): Node[] {
   const graph = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
   graph.setGraph({ rankdir: 'LR', ranksep: 120, nodesep: 34, marginx: 36, marginy: 36 });
-  nodes.forEach((node) => graph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT }));
+  const heightFor = (node: Node) => node.data?.propertySet ? PROPERTY_SET_HEIGHT : NODE_HEIGHT;
+  nodes.forEach((node) => graph.setNode(node.id, { width: NODE_WIDTH, height: heightFor(node) }));
   edges.forEach((edge) => graph.setEdge(edge.source, edge.target));
   dagre.layout(graph);
   const layouted = nodes.map((node) => {
     const position = graph.node(node.id);
-    return { ...node, position: { x: position.x - NODE_WIDTH / 2, y: position.y - NODE_HEIGHT / 2 } };
+    return { ...node, position: { x: position.x - NODE_WIDTH / 2, y: position.y - heightFor(node) / 2 } };
   });
   const anchor = anchorId ? layouted.find((node) => node.id === anchorId) : undefined;
   if (!anchor || !anchorPosition) return layouted;
@@ -90,6 +112,7 @@ function GraphWorkspace() {
   const [selectedId, setSelectedId] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [radius, setRadius] = useState(2);
+  const [linkFilter, setLinkFilter] = useState<LinkFilter>('all');
   const [query, setQuery] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -109,6 +132,7 @@ function GraphWorkspace() {
     setSelectedId('');
     setExpanded(new Set());
     setQuery('');
+    setLinkFilter('all');
     nodePositionsRef.current.clear();
     fittedModelRef.current = null;
     try {
@@ -134,8 +158,8 @@ function GraphWorkspace() {
 
   const visibleIds = useMemo(() => {
     if (!model || !focusId) return new Set<string>();
-    return deriveVisible(focusId, expanded, model.resources, radius);
-  }, [expanded, focusId, model, radius]);
+    return deriveVisible(focusId, expanded, model.resources, radius, linkFilter);
+  }, [expanded, focusId, linkFilter, model, radius]);
 
   useEffect(() => {
     if (!model) return;
@@ -144,6 +168,14 @@ function GraphWorkspace() {
       .map((resource) => {
         const id = resource.id;
         const kind = resourceKind(resource);
+        const propertySet = isPropertySetResource(resource);
+        const propertyRows = propertySet
+          ? propertyEntriesFor(resource, model.resources).map((property) => ({
+            name: property.name,
+            value: property.value,
+            unit: property.unit,
+          }))
+          : undefined;
         return {
           id,
           type: 'building',
@@ -152,26 +184,32 @@ function GraphWorkspace() {
             label: resource.label,
             kind,
             typeLabel: prettify(kind),
-            neighborCount: expansionConnectedIds(id, model.resources).size,
+            neighborCount: expansionConnectedIds(id, model.resources, 10, linkFilter).size,
             expanded: expanded.has(id),
             focused: focusId === id,
             geometryObj: resource.geometryObj,
+            propertySet,
+            propertyRows,
           },
         };
       });
-    const flowEdges: Edge[] = graphEdges(model, visibleIds).map((quad, index) => ({
+    const flowEdges: Edge[] = graphEdges(model, visibleIds, linkFilter).map((quad, index) => {
+      const category = quadLinkCategory(quad, model.resources);
+      const color = EDGE_COLORS[category];
+      return {
       id: `${quad.subject.value}-${quad.predicate.value}-${quad.object.value}-${index}`,
       source: quad.subject.value,
       target: quad.object.value,
       label: prettify(localName(quad.predicate.value)),
       type: 'smoothstep',
-      markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15, color: '#8f938d' },
-      style: { stroke: '#a8aaa5', strokeWidth: 1.35 },
+      markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15, color },
+      style: { stroke: color, strokeWidth: 1.45 },
       labelStyle: { fill: '#666a65', fontSize: 10.5, fontWeight: 600 },
       labelBgStyle: { fill: '#f4f1e9', fillOpacity: 0.92 },
       labelBgPadding: [6, 3] as [number, number],
       labelBgBorderRadius: 4,
-    }));
+      };
+    });
     const layoutedNodes = layoutGraph(
       flowNodes,
       flowEdges,
@@ -185,14 +223,18 @@ function GraphWorkspace() {
       fittedModelRef.current = model;
       requestAnimationFrame(() => fitView({ duration: 420, padding: 0.25, maxZoom: 1.1 }));
     }
-  }, [expanded, fitView, focusId, model, setEdges, setNodes, visibleIds]);
+  }, [expanded, fitView, focusId, linkFilter, model, setEdges, setNodes, visibleIds]);
 
   const handleNodeClick: NodeMouseHandler = useCallback((_, node) => {
     if (!model) return;
     setSelectedId(node.id);
     setFocusId(node.id);
-    setExpanded((current) => expansionAfterClick(node.id, current));
-  }, [model]);
+    setExpanded((current) => expansionAfterClick(node.id, current, linkFilter === 'topology'));
+  }, [linkFilter, model]);
+
+  const handleNodeDragStop: OnNodeDrag = useCallback((_, node) => {
+    nodePositionsRef.current.set(node.id, node.position);
+  }, []);
 
   const openFile = useCallback((file?: File) => {
     if (!file) return;
@@ -229,28 +271,25 @@ function GraphWorkspace() {
   };
 
   const selected = model?.resources.get(selectedId);
-  const root = model?.resources.get(model.rootId);
-  const selectedConnectionIds = selected && model
-    ? [...connectedIds(selected.id, model.resources)]
-    : [];
-  const selectedPropertySetIds = selected && model
-    ? propertySetConnectionIds(selected.id, model.resources)
-    : new Set<string>();
-  const selectedPropertySets = selected && model
-    ? [...selectedPropertySetIds].map((id) => {
-      const relation = selected.outgoing.find((quad) => quad.object.value === id)
-        ?? selected.incoming.find((quad) => quad.subject.value === id);
-      const relationName = relation ? localName(relation.predicate.value) : '';
-      return {
-        id,
-        label: /^pset_/i.test(relationName)
-          ? prettify(relationName)
-          : model.resources.get(id)?.label ?? compactUri(id, model.prefixes),
-      };
-    })
-    : [];
-  const hasPropertySets = selectedPropertySetIds.size > 0;
-  const regularConnectionIds = selectedConnectionIds.filter((id) => !selectedPropertySetIds.has(id));
+  const propertyEntries = selected && model ? propertyEntriesFor(selected, model.resources) : [];
+  const ordinaryAttributes = selected?.properties
+    .filter((quad) => !(quad.predicate.value.startsWith('https://w3id.org/props#')
+      || /(?:property_simple|attribute_simple|quantity_simple)$/i.test(localName(quad.predicate.value)))) ?? [];
+  const propertyGroups = [...propertyEntries.reduce((groups, property) => {
+    const groupName = property.setName ?? 'Ungrouped properties';
+    const group = groups.get(groupName) ?? [];
+    group.push(property);
+    groups.set(groupName, group);
+    return groups;
+  }, new Map<string, typeof propertyEntries>())];
+  const selectedLinks = selected ? [
+    ...selected.outgoing
+      .filter((quad) => quad.predicate.value !== 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
+        && (quad.object.termType === 'NamedNode' || quad.object.termType === 'BlankNode')
+        && model?.resources.has(quad.object.value))
+      .map((quad) => ({ quad, neighborId: quad.object.value, direction: 'outgoing' as const })),
+    ...selected.incoming.map((quad) => ({ quad, neighborId: quad.subject.value, direction: 'incoming' as const })),
+  ] : [];
 
   return (
     <div
@@ -272,18 +311,15 @@ function GraphWorkspace() {
         <div className="file-status" title={fileName}>
           <FileCode2 size={15} />
           <span>{fileName}</span>
-          {model && <em>{model.resources.size.toLocaleString()} resources</em>}
         </div>
         <div className="topbar-actions">
           <a className="icon-link" href="https://github.com/jyrkioraskari/IFCtoLBD" target="_blank" rel="noreferrer" title="IFCtoLBD on GitHub"><Github size={18} /></a>
-          <button className="button primary" onClick={() => inputRef.current?.click()}><Upload size={16} /> Open Turtle</button>
-          <input ref={inputRef} type="file" accept=".ttl,.turtle,text/turtle" hidden onChange={(event) => openFile(event.target.files?.[0])} />
         </div>
       </header>
 
       <aside className="left-panel">
-        <div className="eyebrow">Current model</div>
-        <h1>Explore the building,<br />one relation at a time.</h1>
+        <button className="button primary open-file-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> Open Turtle</button>
+        <input ref={inputRef} type="file" accept=".ttl,.turtle,text/turtle" hidden onChange={(event) => openFile(event.target.files?.[0])} />
         <p className="intro">Select a node to reveal its RDF connections. Distant branches fold away as your focus moves.</p>
 
         <div className="search-wrap">
@@ -303,10 +339,8 @@ function GraphWorkspace() {
         </div>
 
         <div className="section-label"><span>Navigation</span></div>
-        <button className="root-card" onClick={resetToRoot} disabled={!root}>
-          <span className="root-icon"><Focus size={17} /></span>
-          <span><small>Core concept</small><strong>{root?.label ?? 'Finding root…'}</strong><em>{root ? compactUri(root.types[0] ?? root.id, model!.prefixes) : ''}</em></span>
-          <ArrowUpRight size={15} />
+        <button className="home-button" onClick={resetToRoot} disabled={!model}>
+          <House size={16} /> Home
         </button>
 
         <label className="distance-control">
@@ -318,12 +352,26 @@ function GraphWorkspace() {
           </select>
         </label>
 
-        <div className="section-label"><span>Node types</span></div>
-        <div className="legend">
-          {(['site', 'building', 'storey', 'space', 'element', 'resource'] as const).map((kind) => (
-            <span key={kind}><i className={`kind-${kind}`} />{prettify(kind)}</span>
-          ))}
+        <div className="section-label"><span>Lens</span></div>
+        <div className="relation-lens" role="radiogroup" aria-label="Filter graph relations">
+          {LINK_FILTERS.map((filter) => {
+            const Icon = filter.icon;
+            return (
+              <button
+                key={filter.id}
+                className={`lens-option${linkFilter === filter.id ? ' active' : ''}`}
+                onClick={() => setLinkFilter(filter.id)}
+                role="radio"
+                aria-checked={linkFilter === filter.id}
+              >
+                <span className={`lens-icon category-${filter.id}`}><Icon size={14} /></span>
+                <span><strong>{filter.label}</strong><small>{filter.description}</small></span>
+                <i />
+              </button>
+            );
+          })}
         </div>
+        <p className="lens-note">Changes the graph only. The inspector always shows every relation.</p>
 
         <div className="tip"><Info size={15} /><span><strong>Click a node to focus and open it.</strong> Click it again to fold its linked branch.</span></div>
       </aside>
@@ -339,9 +387,10 @@ function GraphWorkspace() {
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onNodeClick={handleNodeClick}
+          onNodeDragStop={handleNodeDragStop}
           onPaneClick={() => setSelectedId('')}
           nodeTypes={nodeTypes}
-          nodesDraggable={false}
+          nodesDraggable
           nodesConnectable={false}
           nodeClickDistance={8}
           zoomOnDoubleClick={false}
@@ -363,7 +412,7 @@ function GraphWorkspace() {
         </ReactFlow>
         <div className="canvas-meta">
           <span><i className="pulse" /> Focused on <strong>{model?.resources.get(focusId)?.label ?? '—'}</strong></span>
-          <span>{visibleIds.size} visible</span>
+          <span>{visibleIds.size} visible · {LINK_FILTERS.find((filter) => filter.id === linkFilter)?.label}</span>
           <button onClick={resetToRoot}><RotateCcw size={13} /> Reset</button>
         </div>
         <button className="inspector-toggle" onClick={() => setInspectorOpen((open) => !open)} title={inspectorOpen ? 'Close inspector' : 'Open inspector'}>
@@ -388,35 +437,62 @@ function GraphWorkspace() {
             </div>
 
             <div className="property-group">
-              <h3>Attributes <span>{selected.properties.length}</span></h3>
-              {selected.properties.map((quad, index) => (
+              <h3>Attributes <span>{ordinaryAttributes.length}</span></h3>
+              {ordinaryAttributes.map((quad, index) => (
                 <div className="property-row" key={`${quad.predicate.value}-${index}`}>
                   <span>{prettify(localName(quad.predicate.value))}</span>
                   <strong title={quad.object.value}>{quad.object.value}</strong>
                 </div>
               ))}
-              {!selected.properties.length && <p className="empty">No literal attributes</p>}
+              {!ordinaryAttributes.length && <p className="empty">No general attributes</p>}
             </div>
 
-            {hasPropertySets && (
+            {propertyEntries.length > 0 && (
               <div className="property-group">
-                <h3>Property sets <span>{selectedPropertySetIds.size}</span></h3>
-                {selectedPropertySets.map((propertySet) => (
-                  <div className="type-row" key={propertySet.id} title={propertySet.id}>
-                    <Check size={13} />{propertySet.label}
-                  </div>
-                ))}
+                <h3>IFC properties <span>{propertyEntries.length}</span></h3>
+                <div className="property-set-groups">
+                  {propertyGroups.map(([groupName, properties]) => (
+                    <section className="property-set-group" key={groupName}>
+                      <div className="property-set-title"><strong>{groupName}</strong><span>{properties.length}</span></div>
+                      <div className="property-cards">
+                        {properties.map((property) => (
+                          <div className="property-card" key={property.id} title={property.id}>
+                            <div className="property-card-head">
+                              <strong>{property.name}</strong>
+                              <i>OPM L{property.level}</i>
+                            </div>
+                            <div className="property-value">
+                              <b title={property.value}>{property.value}</b>
+                              {property.unit && <em>{property.unit}</em>}
+                            </div>
+                            {(property.generatedAt || property.datatype) && (
+                              <div className="property-meta">
+                                {property.generatedAt && <span><Clock3 size={10} />Current state · {new Date(property.generatedAt).toLocaleString()}</span>}
+                                {property.datatype && <code>{property.datatype}</code>}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  ))}
+                </div>
               </div>
             )}
 
             <div className="property-group">
-              <h3>Connections <span>{regularConnectionIds.length}</span></h3>
-              {regularConnectionIds.slice(0, 12).map((id) => (
-                <button className="connection-row" key={id} onClick={() => jumpTo(id)}>
-                  <span className={`result-dot kind-${resourceKind(model!.resources.get(id)!)}`} />
-                  <span>{model!.resources.get(id)?.label}</span><ArrowUpRight size={13} />
+              <h3>All links <span>{selectedLinks.length}</span></h3>
+              {selectedLinks.map(({ quad, neighborId, direction }, index) => (
+                <button className="connection-row link-row" key={`${direction}-${quad.predicate.value}-${neighborId}-${index}`} onClick={() => jumpTo(neighborId)}>
+                  <span className={`link-category category-${quadLinkCategory(quad, model!.resources)}`} title={prettify(quadLinkCategory(quad, model!.resources))} />
+                  <span className="link-copy">
+                    <strong>{model!.resources.get(neighborId)?.label}</strong>
+                    <small>{direction === 'incoming' ? '←' : '→'} {prettify(localName(quad.predicate.value))}</small>
+                  </span>
+                  <ArrowUpRight size={13} />
                 </button>
               ))}
+              {!selectedLinks.length && <p className="empty">No resource links</p>}
             </div>
           </div>
         ) : (

@@ -1,5 +1,5 @@
 import { Handle, Position, type NodeProps } from '@xyflow/react';
-import { Building2, ChevronDown, Layers3, Map, PanelsTopLeft, Shapes, Warehouse } from 'lucide-react';
+import { Building2, ChevronDown, Layers3, Map, PanelsTopLeft, Shapes, TableProperties, Warehouse } from 'lucide-react';
 import GeometryPreview from './GeometryPreview';
 
 export interface BuildingNodeData extends Record<string, unknown> {
@@ -10,6 +10,8 @@ export interface BuildingNodeData extends Record<string, unknown> {
   expanded: boolean;
   focused: boolean;
   geometryObj?: string;
+  propertySet?: boolean;
+  propertyRows?: { name: string; value: string; unit?: string }[];
 }
 
 const icons = {
@@ -24,6 +26,39 @@ const icons = {
 export default function BuildingNode({ data, selected }: NodeProps) {
   const node = data as BuildingNodeData;
   const Icon = icons[node.kind];
+  if (node.propertySet) {
+    return (
+      <div className={`building-node property-set-node${selected ? ' selected' : ''}${node.focused ? ' focused' : ''}`}>
+        <Handle type="target" position={Position.Left} className="node-handle" />
+        <div className="pset-node-head">
+          <span className="node-icon"><TableProperties size={17} strokeWidth={1.8} /></span>
+          <span className="node-copy"><span className="node-type">Property set</span><strong title={node.label}>{node.label}</strong></span>
+          {node.neighborCount > 0 && (
+            <span className={`node-expand${node.expanded ? ' is-open' : ''}`}>
+              <span>{node.neighborCount}</span><ChevronDown size={14} />
+            </span>
+          )}
+        </div>
+        <div className="pset-table-wrap nowheel nodrag">
+          <table className="pset-table">
+            <thead><tr><th>Property</th><th>Value</th></tr></thead>
+            <tbody>
+              {node.propertyRows?.map((property, index) => (
+                <tr key={`${property.name}-${index}`}>
+                  <td title={property.name}>{property.name}</td>
+                  <td title={`${property.value}${property.unit ? ` ${property.unit}` : ''}`}>
+                    {property.value}{property.unit && <small>{property.unit}</small>}
+                  </td>
+                </tr>
+              ))}
+              {!node.propertyRows?.length && <tr><td colSpan={2} className="pset-empty">No values</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <Handle type="source" position={Position.Right} className="node-handle" />
+      </div>
+    );
+  }
   return (
     <div className={`building-node kind-${node.kind}${selected ? ' selected' : ''}${node.focused ? ' focused' : ''}`}>
       <Handle type="target" position={Position.Left} className="node-handle" />

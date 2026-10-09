@@ -5,7 +5,11 @@ import {
   deriveVisible,
   expansionAfterClick,
   expansionConnectedIds,
+  graphEdges,
+  linkCategory,
   parseTurtle,
+  propertyEntriesFor,
+  quadLinkCategory,
   propertySetConnectionIds,
 } from './graph';
 
@@ -84,6 +88,41 @@ describe('LBD graph model', () => {
     expect(expansionAfterClick('b', new Set(['b']))).toEqual(new Set());
   });
 
+  it('preserves the expanded spatial path while navigating topology', () => {
+    expect(expansionAfterClick('storey', new Set(['site', 'building']), true)).toEqual(
+      new Set(['site', 'building', 'storey']),
+    );
+    expect(expansionAfterClick('storey', new Set(['building', 'storey']), true)).toEqual(
+      new Set(['building']),
+    );
+  });
+
+  it('never caps hasStorey links in the topology lens', async () => {
+    const storeys = Array.from({ length: 14 }, (_, index) => `ex:storey_${index}`).join(', ');
+    const model = await parseTurtle(`
+      @prefix bot: <https://w3id.org/bot#> .
+      @prefix ex: <https://example.test/> .
+      ex:building a bot:Building ; bot:hasStorey ${storeys} .`);
+
+    expect(expansionConnectedIds(
+      'https://example.test/building', model.resources, 10, 'topology',
+    ).size).toBe(14);
+  });
+
+  it('does not cap adjacent elements or interfaces in the geometry lens', async () => {
+    const adjacent = Array.from({ length: 14 }, (_, index) => `ex:element_${index}`).join(', ');
+    const model = await parseTurtle(`
+      @prefix bot: <https://w3id.org/bot#> .
+      @prefix ex: <https://example.test/> .
+      ex:space a bot:Space ; bot:adjacentElement ${adjacent} .
+      ex:interface a bot:Interface ; bot:interfaceOf ex:space, ex:element_0 .`);
+
+    const visible = expansionConnectedIds('https://example.test/space', model.resources, 10, 'geometry');
+    expect(visible.size).toBe(15);
+    expect(visible).toContain('https://example.test/interface');
+    expect(visible).toContain('https://example.test/element_13');
+  });
+
   it('keeps large property-set collections out of expansion and favors elements', async () => {
     const propertySets = Array.from({ length: 11 }, (_, index) => `ex:pset_${index}`).join(', ');
     const psetTtl = `
@@ -140,5 +179,109 @@ describe('LBD graph model', () => {
     expect(model.resources.get('https://example.test/wall')?.geometryObj).toBe(encodedObj);
     expect(model.resources.get('https://example.test/wall_geometry')?.properties).toEqual([]);
     expect(createObjPreview(encodedObj)?.path).toContain('M');
+  });
+
+  it('classifies link predicates by navigation purpose', () => {
+    expect(linkCategory('https://w3id.org/bot#hasBuilding')).toBe('topology');
+    expect(linkCategory('https://w3id.org/bot#containsElement')).toBe('geometry');
+    expect(linkCategory('https://w3id.org/bot#interfaceOf')).toBe('geometry');
+    expect(linkCategory('https://w3id.org/bot#adjacentElement')).toBe('geometry');
+    expect(linkCategory('https://w3id.org/omg#hasGeometry')).toBe('geometry');
+    expect(linkCategory('https://w3id.org/props#Pset_WallCommon')).toBe('properties');
+    expect(linkCategory('https://example.test/relatedTo')).toBe('other');
+  });
+
+  it('filters traversal and graph edges with the same relation lens', async () => {
+    const model = await parseTurtle(`
+      @prefix bot: <https://w3id.org/bot#> .
+      @prefix omg: <https://w3id.org/omg#> .
+      @prefix props: <https://w3id.org/props#> .
+      @prefix ex: <https://example.test/> .
+      ex:building a bot:Building ; bot:hasStorey ex:storey ; omg:hasGeometry ex:geometry ; props:Pset_Building ex:pset .`);
+    const building = 'https://example.test/building';
+    const visible = deriveVisible(building, new Set([building]), model.resources, 1, 'geometry');
+
+    expect(visible).toEqual(new Set([
+      building,
+      'https://example.test/storey',
+      'https://example.test/geometry',
+    ]));
+    expect(graphEdges(model, visible, 'geometry')).toHaveLength(2);
+    expect(expansionConnectedIds(building, model.resources, 10, 'properties')).toEqual(
+      new Set(['https://example.test/pset']),
+    );
+  });
+
+  it('normalizes IFCtoLBD OPM levels into intuitive property entries', async () => {
+    const model = await parseTurtle(`
+      @prefix ex: <https://example.test/> .
+      @prefix props: <https://w3id.org/props#> .
+      @prefix opm: <https://w3id.org/opm#> .
+      @prefix schema: <http://schema.org/> .
+      @prefix prov: <http://www.w3.org/ns/prov#> .
+      ex:wall props:reference_property_simple "A-01" ;
+        props:loadBearing ex:load ; props:fireRating ex:fire .
+      ex:load a opm:Property ; schema:value true .
+      ex:fire a opm:Property ; <http://www.w3.org/2000/01/rdf-schema#label> "Pset_WallCommon:FireRating" ;
+        opm:hasPropertyState ex:fireState .
+      ex:fireState a opm:CurrentPropertyState ; schema:value "EI60" ;
+        prov:generatedAtTime "2026-10-08T10:00:00Z" .
+      props:reference_property_simple <http://www.w3.org/2000/01/rdf-schema#comment>
+        "IFC property set Pset_IdentityData property Reference" .`);
+    const entries = propertyEntriesFor(model.resources.get('https://example.test/wall')!, model.resources);
+
+    expect(entries.map((entry) => [entry.name, entry.value, entry.level])).toEqual([
+      ['Reference', 'A-01', 1],
+      ['Load Bearing', 'true', 2],
+      ['Fire Rating', 'EI60', 3],
+    ]);
+    expect(entries[2].setName).toBe('Pset_WallCommon');
+    expect(entries[2].generatedAt).toBe('2026-10-08T10:00:00Z');
+    expect(entries[0].setName).toBe('Pset_IdentityData');
+  });
+
+  it('classifies links by their property-set target even with a custom predicate', async () => {
+    const model = await parseTurtle(`
+      @prefix ex: <https://example.test/> .
+      @prefix bsddm: <https://w3id.org/ifc2lbd/bsdd-meta#> .
+      ex:wall ex:customSetLink ex:wallCommon .
+      ex:wallCommon a bsddm:PropertySet .`);
+    const quad = model.quads.find((candidate) => candidate.predicate.value.endsWith('customSetLink'))!;
+
+    expect(quadLinkCategory(quad, model.resources)).toBe('properties');
+    expect(graphEdges(model, new Set([quad.subject.value, quad.object.value]), 'properties')).toEqual([quad]);
+  });
+
+  it('reads name-value rows directly from an explicit property-set resource', async () => {
+    const model = await parseTurtle(`
+      @prefix bsddm: <https://w3id.org/ifc2lbd/bsdd-meta#> .
+      @prefix opm: <https://w3id.org/opm#> .
+      @prefix schema: <http://schema.org/> .
+      @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+      @prefix ex: <https://example.test/> .
+      ex:wall bsddm:hasPropertySet ex:set .
+      ex:set a bsddm:PropertySet ; rdfs:label "Pset_WallCommon" ; bsddm:containsProperty ex:load .
+      ex:load a opm:Property ; rdfs:label "Pset_WallCommon:LoadBearing" ; schema:value true .`);
+    const rows = propertyEntriesFor(model.resources.get('https://example.test/set')!, model.resources);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ name: 'Load Bearing', value: 'true', setName: 'Pset_WallCommon' });
+    expect(expansionConnectedIds('https://example.test/set', model.resources, 10, 'properties')).toEqual(
+      new Set(['https://example.test/wall']),
+    );
+  });
+
+  it('shows every explicit property-set node even when an element has more than ten', async () => {
+    const sets = Array.from({ length: 13 }, (_, index) => `ex:set_${index}`);
+    const declarations = sets.map((set) => `${set} a bsddm:PropertySet .`).join('\n');
+    const model = await parseTurtle(`
+      @prefix bsddm: <https://w3id.org/ifc2lbd/bsdd-meta#> .
+      @prefix ex: <https://example.test/> .
+      ex:wall bsddm:hasPropertySet ${sets.join(', ')} .
+      ${declarations}`);
+
+    expect(expansionConnectedIds(
+      'https://example.test/wall', model.resources, 10, 'properties',
+    ).size).toBe(13);
   });
 });
