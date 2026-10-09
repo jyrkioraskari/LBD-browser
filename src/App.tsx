@@ -38,13 +38,17 @@ import {
   X,
 } from 'lucide-react';
 import BuildingNode, { type BuildingNodeData } from './BuildingNode';
+import RelationEdge from './RelationEdge';
 import {
+  attributeEntriesFor,
   compactUri,
   deriveVisible,
   expansionAfterClick,
   expansionConnectedIds,
   graphEdges,
+  isAttributePredicate,
   isPropertySetResource,
+  isQuantitySetResource,
   localName,
   parseTurtle,
   prettify,
@@ -54,12 +58,15 @@ import {
   type GraphModel,
   type LinkFilter,
 } from './graph';
-import { SAMPLE_TURTLE } from './sample';
+
+const DEFAULT_TURTLE_URL = new URL('../Duplex_LBD.ttl', import.meta.url).href;
 
 const NODE_WIDTH = 248;
 const NODE_HEIGHT = 76;
 const PROPERTY_SET_HEIGHT = 224;
+const ATTRIBUTE_NODE_HEIGHT = 224;
 const nodeTypes = { building: BuildingNode };
+const edgeTypes = { relation: RelationEdge };
 const LINK_FILTERS: { id: LinkFilter; label: string; description: string; icon: typeof Layers3 }[] = [
   { id: 'all', label: 'All relations', description: 'Complete linked view', icon: Layers3 },
   { id: 'topology', label: 'Spatial topology', description: 'Building structure & adjacency', icon: Network },
@@ -74,6 +81,30 @@ const EDGE_COLORS = {
   other: '#8f938d',
 };
 
+function expansionForDepth(
+  rootId: string,
+  model: GraphModel,
+  depth: number,
+  filter: LinkFilter,
+) {
+  const expanded = new Set<string>();
+  let frontier = new Set([rootId]);
+  const visited = new Set<string>();
+  for (let level = 0; level < depth; level += 1) {
+    const next = new Set<string>();
+    for (const id of frontier) {
+      if (visited.has(id)) continue;
+      visited.add(id);
+      expanded.add(id);
+      for (const neighbor of expansionConnectedIds(id, model.resources, 10, filter)) {
+        if (!visited.has(neighbor)) next.add(neighbor);
+      }
+    }
+    frontier = next;
+  }
+  return expanded;
+}
+
 function layoutGraph(
   nodes: Node[],
   edges: Edge[],
@@ -82,7 +113,11 @@ function layoutGraph(
 ): Node[] {
   const graph = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}));
   graph.setGraph({ rankdir: 'LR', ranksep: 120, nodesep: 34, marginx: 36, marginy: 36 });
-  const heightFor = (node: Node) => node.data?.propertySet ? PROPERTY_SET_HEIGHT : NODE_HEIGHT;
+  const heightFor = (node: Node) => node.data?.propertySet
+    ? PROPERTY_SET_HEIGHT
+    : Array.isArray(node.data?.attributeRows) && node.data.attributeRows.length
+      ? ATTRIBUTE_NODE_HEIGHT
+      : NODE_HEIGHT;
   nodes.forEach((node) => graph.setNode(node.id, { width: NODE_WIDTH, height: heightFor(node) }));
   edges.forEach((edge) => graph.setEdge(edge.source, edge.target));
   dagre.layout(graph);
@@ -103,11 +138,13 @@ function layoutGraph(
 function GraphWorkspace() {
   const inputRef = useRef<HTMLInputElement>(null);
   const loadSequenceRef = useRef(0);
+  const startupLoadCancelledRef = useRef(false);
   const nodePositionsRef = useRef(new Map<string, { x: number; y: number }>());
   const fittedModelRef = useRef<GraphModel | null>(null);
+  const homeFitPendingRef = useRef(false);
   const { fitView, setCenter } = useReactFlow();
   const [model, setModel] = useState<GraphModel | null>(null);
-  const [fileName, setFileName] = useState('Duplex sample.ttl');
+  const [fileName, setFileName] = useState('Duplex_LBD.ttl');
   const [focusId, setFocusId] = useState('');
   const [selectedId, setSelectedId] = useState('');
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -116,12 +153,13 @@ function GraphWorkspace() {
   const [query, setQuery] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [homeFitRequest, setHomeFitRequest] = useState(0);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
-  const loadTurtle = useCallback(async (source: string, name: string) => {
+  const loadTurtle = useCallback(async (source: string, name: string, initialRadius = 1) => {
     const loadSequence = ++loadSequenceRef.current;
     setLoading(true);
     setError('');
@@ -132,6 +170,7 @@ function GraphWorkspace() {
     setSelectedId('');
     setExpanded(new Set());
     setQuery('');
+    setRadius(initialRadius);
     setLinkFilter('all');
     nodePositionsRef.current.clear();
     fittedModelRef.current = null;
@@ -142,7 +181,7 @@ function GraphWorkspace() {
       setFileName(name);
       setFocusId(nextModel.rootId);
       setSelectedId(nextModel.rootId);
-      setExpanded(new Set());
+      setExpanded(expansionForDepth(nextModel.rootId, nextModel, initialRadius, 'all'));
       setQuery('');
     } catch (reason) {
       if (loadSequence !== loadSequenceRef.current) return;
@@ -153,7 +192,21 @@ function GraphWorkspace() {
   }, [setEdges, setNodes]);
 
   useEffect(() => {
-    void loadTurtle(SAMPLE_TURTLE, 'Duplex sample.ttl');
+    let active = true;
+    void fetch(DEFAULT_TURTLE_URL)
+      .then((response) => {
+        if (!response.ok) throw new Error(`Could not load the default Turtle file (${response.status}).`);
+        return response.text();
+      })
+      .then((source) => {
+        if (active && !startupLoadCancelledRef.current) void loadTurtle(source, 'Duplex_LBD.ttl', 2);
+      })
+      .catch((reason) => {
+        if (!active || startupLoadCancelledRef.current) return;
+        setError(reason instanceof Error ? reason.message : 'The default Turtle file could not be loaded.');
+        setLoading(false);
+      });
+    return () => { active = false; };
   }, [loadTurtle]);
 
   const visibleIds = useMemo(() => {
@@ -169,13 +222,20 @@ function GraphWorkspace() {
         const id = resource.id;
         const kind = resourceKind(resource);
         const propertySet = isPropertySetResource(resource);
-        const propertyRows = propertySet
+        const setKind = propertySet && isQuantitySetResource(resource) ? 'quantity' : 'property';
+        const propertyRows = propertySet && linkFilter === 'properties'
           ? propertyEntriesFor(resource, model.resources).map((property) => ({
             name: property.name,
             value: property.value,
             unit: property.unit,
           }))
           : undefined;
+        const attributeRows = propertySet || linkFilter === 'all'
+          ? undefined
+          : attributeEntriesFor(resource, model.resources).map((attribute) => ({
+            name: attribute.name,
+            value: attribute.value,
+          }));
         return {
           id,
           type: 'building',
@@ -183,27 +243,35 @@ function GraphWorkspace() {
           data: {
             label: resource.label,
             kind,
-            typeLabel: prettify(kind),
+            typeLabel: propertySet ? prettify(`${setKind} set`) : prettify(kind),
             neighborCount: expansionConnectedIds(id, model.resources, 10, linkFilter).size,
             expanded: expanded.has(id),
             focused: focusId === id,
             geometryObj: resource.geometryObj,
             propertySet,
+            setKind,
             propertyRows,
+            attributeRows,
           },
         };
       });
     const flowEdges: Edge[] = graphEdges(model, visibleIds, linkFilter).map((quad, index) => {
       const category = quadLinkCategory(quad, model.resources);
       const color = EDGE_COLORS[category];
+      const contextualTopology = category === 'topology'
+        && (linkFilter === 'properties' || linkFilter === 'geometry');
       return {
       id: `${quad.subject.value}-${quad.predicate.value}-${quad.object.value}-${index}`,
       source: quad.subject.value,
       target: quad.object.value,
       label: prettify(localName(quad.predicate.value)),
-      type: 'smoothstep',
+      type: 'relation',
       markerEnd: { type: MarkerType.ArrowClosed, width: 15, height: 15, color },
-      style: { stroke: color, strokeWidth: 1.45 },
+      style: {
+        stroke: color,
+        strokeWidth: 1.45,
+        ...(contextualTopology ? { strokeDasharray: '6 5' } : {}),
+      },
       labelStyle: { fill: '#666a65', fontSize: 10.5, fontWeight: 600 },
       labelBgStyle: { fill: '#f4f1e9', fillOpacity: 0.92 },
       labelBgPadding: [6, 3] as [number, number],
@@ -219,11 +287,25 @@ function GraphWorkspace() {
     nodePositionsRef.current = new Map(layoutedNodes.map((node) => [node.id, node.position]));
     setNodes(layoutedNodes);
     setEdges(flowEdges);
+    if (homeFitPendingRef.current) {
+      homeFitPendingRef.current = false;
+      const homeNode = layoutedNodes.find((node) => node.id === model.rootId);
+      if (homeNode) {
+        const homeHeight = Array.isArray(homeNode.data?.attributeRows) && homeNode.data.attributeRows.length
+          ? ATTRIBUTE_NODE_HEIGHT
+          : NODE_HEIGHT;
+        requestAnimationFrame(() => setCenter(
+          homeNode.position.x + NODE_WIDTH / 2,
+          homeNode.position.y + homeHeight / 2,
+          { duration: 420, zoom: 1.05 },
+        ));
+      }
+    }
     if (fittedModelRef.current !== model) {
       fittedModelRef.current = model;
       requestAnimationFrame(() => fitView({ duration: 420, padding: 0.25, maxZoom: 1.1 }));
     }
-  }, [expanded, fitView, focusId, linkFilter, model, setEdges, setNodes, visibleIds]);
+  }, [expanded, fitView, focusId, homeFitRequest, linkFilter, model, setCenter, setEdges, setNodes, visibleIds]);
 
   const handleNodeClick: NodeMouseHandler = useCallback((_, node) => {
     if (!model) return;
@@ -238,6 +320,7 @@ function GraphWorkspace() {
 
   const openFile = useCallback((file?: File) => {
     if (!file) return;
+    startupLoadCancelledRef.current = true;
     const reader = new FileReader();
     reader.onload = () => void loadTurtle(String(reader.result), file.name);
     reader.onerror = () => setError('The selected file could not be read.');
@@ -246,11 +329,13 @@ function GraphWorkspace() {
 
   const resetToRoot = useCallback(() => {
     if (!model) return;
+    homeFitPendingRef.current = true;
+    setHomeFitRequest((request) => request + 1);
     setFocusId(model.rootId);
     setSelectedId(model.rootId);
-    setExpanded(new Set());
-    requestAnimationFrame(() => fitView({ duration: 400, padding: 0.3 }));
-  }, [fitView, model]);
+    setExpanded(expansionForDepth(model.rootId, model, 2, linkFilter));
+    setRadius(2);
+  }, [linkFilter, model]);
 
   const searchResults = useMemo(() => {
     if (!model || query.trim().length < 2) return [];
@@ -272,6 +357,7 @@ function GraphWorkspace() {
 
   const selected = model?.resources.get(selectedId);
   const propertyEntries = selected && model ? propertyEntriesFor(selected, model.resources) : [];
+  const attributeEntries = selected && model ? attributeEntriesFor(selected, model.resources) : [];
   const ordinaryAttributes = selected?.properties
     .filter((quad) => !(quad.predicate.value.startsWith('https://w3id.org/props#')
       || /(?:property_simple|attribute_simple|quantity_simple)$/i.test(localName(quad.predicate.value)))) ?? [];
@@ -285,6 +371,7 @@ function GraphWorkspace() {
   const selectedLinks = selected ? [
     ...selected.outgoing
       .filter((quad) => quad.predicate.value !== 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type'
+        && !isAttributePredicate(quad.predicate.value, model!.resources)
         && (quad.object.termType === 'NamedNode' || quad.object.termType === 'BlankNode')
         && model?.resources.has(quad.object.value))
       .map((quad) => ({ quad, neighborId: quad.object.value, direction: 'outgoing' as const })),
@@ -390,6 +477,7 @@ function GraphWorkspace() {
           onNodeDragStop={handleNodeDragStop}
           onPaneClick={() => setSelectedId('')}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
           nodesDraggable
           nodesConnectable={false}
           nodeClickDistance={8}
@@ -437,19 +525,25 @@ function GraphWorkspace() {
             </div>
 
             <div className="property-group">
-              <h3>Attributes <span>{ordinaryAttributes.length}</span></h3>
+              <h3>Attributes <span>{attributeEntries.length + ordinaryAttributes.length}</span></h3>
+              {attributeEntries.map((attribute) => (
+                <div className="property-row" key={attribute.id}>
+                  <span>{attribute.name}</span>
+                  <strong title={attribute.value}>{attribute.value}</strong>
+                </div>
+              ))}
               {ordinaryAttributes.map((quad, index) => (
                 <div className="property-row" key={`${quad.predicate.value}-${index}`}>
                   <span>{prettify(localName(quad.predicate.value))}</span>
                   <strong title={quad.object.value}>{quad.object.value}</strong>
                 </div>
               ))}
-              {!ordinaryAttributes.length && <p className="empty">No general attributes</p>}
+              {!attributeEntries.length && !ordinaryAttributes.length && <p className="empty">No general attributes</p>}
             </div>
 
             {propertyEntries.length > 0 && (
               <div className="property-group">
-                <h3>IFC properties <span>{propertyEntries.length}</span></h3>
+                <h3>IFC property & quantity sets <span>{propertyEntries.length}</span></h3>
                 <div className="property-set-groups">
                   {propertyGroups.map(([groupName, properties]) => (
                     <section className="property-set-group" key={groupName}>

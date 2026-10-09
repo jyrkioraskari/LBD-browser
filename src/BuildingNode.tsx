@@ -11,7 +11,9 @@ export interface BuildingNodeData extends Record<string, unknown> {
   focused: boolean;
   geometryObj?: string;
   propertySet?: boolean;
+  setKind?: 'property' | 'quantity';
   propertyRows?: { name: string; value: string; unit?: string }[];
+  attributeRows?: { name: string; value: string }[];
 }
 
 const icons = {
@@ -26,13 +28,13 @@ const icons = {
 export default function BuildingNode({ data, selected }: NodeProps) {
   const node = data as BuildingNodeData;
   const Icon = icons[node.kind];
-  if (node.propertySet) {
+  if (node.propertySet && node.propertyRows) {
     return (
       <div className={`building-node property-set-node${selected ? ' selected' : ''}${node.focused ? ' focused' : ''}`}>
         <Handle type="target" position={Position.Left} className="node-handle" />
         <div className="pset-node-head">
           <span className="node-icon"><TableProperties size={17} strokeWidth={1.8} /></span>
-          <span className="node-copy"><span className="node-type">Property set</span><strong title={node.label}>{node.label}</strong></span>
+          <span className="node-copy"><span className="node-type">{node.setKind === 'quantity' ? 'Quantity set' : 'Property set'}</span><strong title={node.label}>{node.label}</strong></span>
           {node.neighborCount > 0 && (
             <span className={`node-expand${node.expanded ? ' is-open' : ''}`}>
               <span>{node.neighborCount}</span><ChevronDown size={14} />
@@ -41,7 +43,7 @@ export default function BuildingNode({ data, selected }: NodeProps) {
         </div>
         <div className="pset-table-wrap nowheel nodrag">
           <table className="pset-table">
-            <thead><tr><th>Property</th><th>Value</th></tr></thead>
+            <thead><tr><th>{node.setKind === 'quantity' ? 'Quantity' : 'Property'}</th><th>Value</th></tr></thead>
             <tbody>
               {node.propertyRows?.map((property, index) => (
                 <tr key={`${property.name}-${index}`}>
@@ -52,6 +54,38 @@ export default function BuildingNode({ data, selected }: NodeProps) {
                 </tr>
               ))}
               {!node.propertyRows?.length && <tr><td colSpan={2} className="pset-empty">No values</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <Handle type="source" position={Position.Right} className="node-handle" />
+      </div>
+    );
+  }
+  if (node.attributeRows?.length) {
+    return (
+      <div className={`building-node attribute-node kind-${node.kind}${selected ? ' selected' : ''}${node.focused ? ' focused' : ''}`}>
+        <Handle type="target" position={Position.Left} className="node-handle" />
+        <div className="pset-node-head">
+          {node.geometryObj ? (
+            <GeometryPreview encodedObj={node.geometryObj} fallback={<span className="node-icon"><Icon size={17} strokeWidth={1.8} /></span>} />
+          ) : <span className="node-icon"><Icon size={17} strokeWidth={1.8} /></span>}
+          <span className="node-copy"><span className="node-type">{node.typeLabel}</span><strong title={node.label}>{node.label}</strong></span>
+          {node.neighborCount > 0 && (
+            <span className={`node-expand${node.expanded ? ' is-open' : ''}`}>
+              <span>{node.neighborCount}</span><ChevronDown size={14} />
+            </span>
+          )}
+        </div>
+        <div className="pset-table-wrap nowheel nodrag">
+          <table className="pset-table attribute-table">
+            <thead><tr><th>Attribute</th><th>Value</th></tr></thead>
+            <tbody>
+              {node.attributeRows.map((attribute, index) => (
+                <tr key={`${attribute.name}-${index}`}>
+                  <td title={attribute.name}>{attribute.name}</td>
+                  <td title={attribute.value}>{attribute.value}</td>
+                </tr>
+              ))}
             </tbody>
           </table>
         </div>

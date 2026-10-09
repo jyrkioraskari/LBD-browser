@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { createObjPreview } from './geometry';
 import {
+  attributeEntriesFor,
   connectedIds,
   deriveVisible,
   expansionAfterClick,
   expansionConnectedIds,
   graphEdges,
   linkCategory,
+  isQuantitySetResource,
   parseTurtle,
   propertyEntriesFor,
   quadLinkCategory,
@@ -58,15 +60,14 @@ describe('LBD graph model', () => {
       ex:hub ex:common ${commonConnections} ; ex:rare ex:rare_1, ex:rare_2 .`;
     const model = await parseTurtle(crowdedTtl);
 
-    expect([...expansionConnectedIds('https://example.test/hub', model.resources)]).toEqual([
+    expect([...expansionConnectedIds('https://example.test/hub', model.resources, 10, 'other')]).toEqual([
       'https://example.test/rare_1',
       'https://example.test/rare_2',
     ]);
     expect(deriveVisible(
       'https://example.test/hub',
       new Set(['https://example.test/hub']),
-      model.resources,
-      1,
+      model.resources, 1, 'other',
     )).toEqual(new Set([
       'https://example.test/hub',
       'https://example.test/rare_1',
@@ -79,7 +80,7 @@ describe('LBD graph model', () => {
     const crowdedTtl = `@prefix ex: <https://example.test/> . ex:hub ex:common ${connections} .`;
     const model = await parseTurtle(crowdedTtl);
 
-    expect(expansionConnectedIds('https://example.test/hub', model.resources).size).toBe(10);
+    expect(expansionConnectedIds('https://example.test/hub', model.resources, 10, 'other').size).toBe(10);
   });
 
   it('keeps exactly one active expansion and toggles that node on repeated clicks', () => {
@@ -123,7 +124,7 @@ describe('LBD graph model', () => {
     expect(visible).toContain('https://example.test/element_13');
   });
 
-  it('keeps large property-set collections out of expansion and favors elements', async () => {
+  it('keeps property-set collections visible in All relations', async () => {
     const propertySets = Array.from({ length: 11 }, (_, index) => `ex:pset_${index}`).join(', ');
     const psetTtl = `
       @prefix bot: <https://w3id.org/bot#> .
@@ -136,10 +137,10 @@ describe('LBD graph model', () => {
 
     expect(propertySetConnectionIds(wallId, model.resources).size).toBe(11);
     expect(expanded).toContain('https://example.test/beam');
-    expect(expanded.some((id) => id.includes('pset_'))).toBe(false);
+    expect(expanded.some((id) => id.includes('pset_'))).toBe(true);
   });
 
-  it('keeps even a single property-set connection out of the graph', async () => {
+  it('keeps a property-set connection in All relations', async () => {
     const model = await parseTurtle(`
       @prefix bot: <https://w3id.org/bot#> .
       @prefix ex: <https://example.test/> .
@@ -147,7 +148,7 @@ describe('LBD graph model', () => {
       ex:beam a bot:Element .`);
 
     expect(expansionConnectedIds('https://example.test/wall', model.resources)).toEqual(
-      new Set(['https://example.test/beam']),
+      new Set(['https://example.test/pset', 'https://example.test/beam']),
     );
   });
 
@@ -159,7 +160,7 @@ describe('LBD graph model', () => {
       @prefix ex: <https://example.test/> .
       ex:storey ex:contains ${elements.join(', ')} ; ex:rare ex:note_1, ex:note_2 .
       ${elementTypes}`);
-    const expanded = [...expansionConnectedIds('https://example.test/storey', model.resources)];
+    const expanded = [...expansionConnectedIds('https://example.test/storey', model.resources, 10, 'other')];
 
     expect(expanded).toHaveLength(10);
     expect(expanded.every((id) => id.includes('/element_'))).toBe(true);
@@ -197,7 +198,8 @@ describe('LBD graph model', () => {
       @prefix omg: <https://w3id.org/omg#> .
       @prefix props: <https://w3id.org/props#> .
       @prefix ex: <https://example.test/> .
-      ex:building a bot:Building ; bot:hasStorey ex:storey ; omg:hasGeometry ex:geometry ; props:Pset_Building ex:pset .`);
+      ex:building a bot:Building ; bot:hasStorey ex:storey ; omg:hasGeometry ex:geometry ; props:Pset_Building ex:pset .
+      ex:storey bot:hasSpace ex:space .`);
     const building = 'https://example.test/building';
     const visible = deriveVisible(building, new Set([building]), model.resources, 1, 'geometry');
 
@@ -208,20 +210,24 @@ describe('LBD graph model', () => {
     ]));
     expect(graphEdges(model, visible, 'geometry')).toHaveLength(2);
     expect(expansionConnectedIds(building, model.resources, 10, 'properties')).toEqual(
-      new Set(['https://example.test/pset']),
+      new Set(['https://example.test/pset', 'https://example.test/storey']),
     );
+    expect(graphEdges(model, new Set([
+      'https://example.test/storey', 'https://example.test/space',
+    ]), 'properties')).toHaveLength(1);
   });
 
   it('normalizes IFCtoLBD OPM levels into intuitive property entries', async () => {
     const model = await parseTurtle(`
       @prefix ex: <https://example.test/> .
       @prefix props: <https://w3id.org/props#> .
+      @prefix bot: <https://w3id.org/bot#> .
       @prefix opm: <https://w3id.org/opm#> .
       @prefix schema: <http://schema.org/> .
       @prefix prov: <http://www.w3.org/ns/prov#> .
-      ex:wall props:reference_property_simple "A-01" ;
+      ex:wall a bot:Element ; props:reference_property_simple "A-01" ;
         props:loadBearing ex:load ; props:fireRating ex:fire .
-      ex:load a opm:Property ; schema:value true .
+      ex:load a opm:Property ; <http://www.w3.org/2000/01/rdf-schema#label> "Pset_WallCommon:LoadBearing" ; schema:value true .
       ex:fire a opm:Property ; <http://www.w3.org/2000/01/rdf-schema#label> "Pset_WallCommon:FireRating" ;
         opm:hasPropertyState ex:fireState .
       ex:fireState a opm:CurrentPropertyState ; schema:value "EI60" ;
@@ -238,6 +244,14 @@ describe('LBD graph model', () => {
     expect(entries[2].setName).toBe('Pset_WallCommon');
     expect(entries[2].generatedAt).toBe('2026-10-08T10:00:00Z');
     expect(entries[0].setName).toBe('Pset_IdentityData');
+
+    const propertyNodes = expansionConnectedIds(
+      'https://example.test/wall', model.resources, 10, 'properties',
+    );
+    expect(propertyNodes.size).toBe(2);
+    expect([...propertyNodes].every((id) => model.resources.get(id)?.virtualPropertySet)).toBe(true);
+    expect([...propertyNodes].flatMap((id) => propertyEntriesFor(model.resources.get(id)!, model.resources))
+      .map((entry) => entry.value)).toEqual(expect.arrayContaining(['A-01', 'true', 'EI60']));
   });
 
   it('classifies links by their property-set target even with a custom predicate', async () => {
@@ -283,5 +297,44 @@ describe('LBD graph model', () => {
     expect(expansionConnectedIds(
       'https://example.test/wall', model.resources, 10, 'properties',
     ).size).toBe(13);
+  });
+
+  it('aggregates IFC quantity sets into the same table-node model', async () => {
+    const model = await parseTurtle(`
+      @prefix bot: <https://w3id.org/bot#> .
+      @prefix props: <https://w3id.org/props#> .
+      @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+      @prefix ex: <https://example.test/> .
+      ex:wall a bot:Element ; props:netSideArea_property_simple "42.5" .
+      props:netSideArea_property_simple rdfs:comment
+        "IFC property set Qto_WallBaseQuantities property NetSideArea" .`);
+    const setIds = expansionConnectedIds('https://example.test/wall', model.resources, 10, 'properties');
+
+    expect(setIds.size).toBe(1);
+    const quantitySet = model.resources.get([...setIds][0])!;
+    expect(isQuantitySetResource(quantitySet)).toBe(true);
+    expect(quantitySet.label).toBe('Qto_WallBaseQuantities');
+    expect(propertyEntriesFor(quantitySet, model.resources)[0]).toMatchObject({
+      name: 'Net Side Area', value: '42.5', level: 1,
+    });
+  });
+
+  it('folds IFC attribute resources into the building element and removes their links', async () => {
+    const model = await parseTurtle(`
+      @prefix bot: <https://w3id.org/bot#> .
+      @prefix opm: <https://w3id.org/opm#> .
+      @prefix schema: <http://schema.org/> .
+      @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+      @prefix ex: <https://example.test/> .
+      ex:wall a bot:Element ; ex:globalIdIfcRoot ex:globalId .
+      ex:globalIdIfcRoot rdfs:comment "IFC standard attribute globalIdIfcRoot" .
+      ex:globalId a opm:Property ; schema:value "2O2Fr-test" .`);
+    const wall = model.resources.get('https://example.test/wall')!;
+
+    expect(attributeEntriesFor(wall, model.resources)).toEqual([
+      expect.objectContaining({ name: 'Global Id', value: '2O2Fr-test', level: 2 }),
+    ]);
+    expect(expansionConnectedIds(wall.id, model.resources, 10, 'properties')).toEqual(new Set());
+    expect(graphEdges(model, new Set([wall.id, 'https://example.test/globalId']), 'all')).toEqual([]);
   });
 });

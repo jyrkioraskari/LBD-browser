@@ -1,4 +1,4 @@
-import { Parser, type Quad, type Term } from 'n3';
+import { DataFactory, Parser, type Quad, type Term } from 'n3';
 
 export const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
 export const RDFS_LABEL = 'http://www.w3.org/2000/01/rdf-schema#label';
@@ -28,6 +28,8 @@ export interface Resource {
   properties: Quad[];
   geometryObj?: string;
   propertySet?: boolean;
+  virtualPropertySet?: boolean;
+  propertyEntries?: PropertyEntry[];
 }
 
 export interface GraphModel {
@@ -135,6 +137,8 @@ export function buildModel(quads: Quad[], prefixes: Prefixes = {}): GraphModel {
     }
   }
 
+  materializePropertySetGroups(resources, quads);
+
   const rootId = chooseRoot(resources);
   return { quads, resources, prefixes, rootId };
 }
@@ -210,7 +214,16 @@ export function quadLinkCategory(quad: Quad, resources: Map<string, Resource>): 
   return linkCategory(quad.predicate.value);
 }
 
+function isNavigationBackbone(predicate: string) {
+  return /^(?:hasBuilding|hasStorey|hasSpace)$/i.test(localName(predicate));
+}
+
 function matchesQuadLinkFilter(quad: Quad, resources: Map<string, Resource>, filter: LinkFilter): boolean {
+  const subject = resources.get(quad.subject.value);
+  const object = isResource(quad.object) ? resources.get(quad.object.value) : undefined;
+  if (subject?.virtualPropertySet || object?.virtualPropertySet) return filter === 'properties';
+  if (isAttributePredicate(quad.predicate.value, resources)) return false;
+  if (isNavigationBackbone(quad.predicate.value)) return true;
   if (filter === 'all' || quadLinkCategory(quad, resources) === filter) return true;
   return filter === 'geometry'
     && /^(?:hasBuilding|hasStorey|hasSpace|containsZone|hasSubElement)$/i.test(localName(quad.predicate.value));
@@ -245,7 +258,8 @@ export function connectedIds(
 }
 
 function isPropertySetName(value: string): boolean {
-  return /^pset_/i.test(localName(value)) || /propertyset/i.test(localName(value));
+  const name = localName(value);
+  return /^(?:pset_|qto_)/i.test(name) || /(?:property|quantity)set/i.test(name);
 }
 
 export function isPropertySetResource(resource: Resource): boolean {
@@ -254,6 +268,11 @@ export function isPropertySetResource(resource: Resource): boolean {
     || isPropertySetName(resource.id)
     || isPropertySetName(resource.label)
     || resource.types.some(isPropertySetName);
+}
+
+export function isQuantitySetResource(resource: Resource): boolean {
+  const names = [resource.id, resource.label, ...resource.types].map(localName);
+  return names.some((name) => /^qto_/i.test(name) || /quantityset/i.test(name));
 }
 
 function literalValue(resource: Resource, predicate: (name: string, uri: string) => boolean) {
@@ -274,6 +293,14 @@ function propertyLabel(resource: Resource, fallback: string) {
   return separator > 0
     ? { setName: label.slice(0, separator), name: prettify(label.slice(separator + 1)) }
     : { name: prettify(label.replace(/_(?:property_)?simple$/i, '')) };
+}
+
+export function isAttributePredicate(predicate: string, resources: Map<string, Resource>) {
+  if (/_attribute_simple$/i.test(localName(predicate))) return true;
+  return resources.get(predicate)?.outgoing.some((quad) =>
+    quad.predicate.value === RDFS_COMMENT
+    && quad.object.termType === 'Literal'
+    && /^IFC standard attribute\s+/i.test(quad.object.value)) ?? false;
 }
 
 function opmPropertyEntry(
@@ -310,6 +337,7 @@ function opmPropertyEntry(
 
 /** Normalizes IFCtoLBD OPM levels 1–3 and explicit property-set containers for the UI. */
 export function propertyEntriesFor(resource: Resource, resources: Map<string, Resource>): PropertyEntry[] {
+  if (resource.virtualPropertySet) return resource.propertyEntries ?? [];
   const entries: PropertyEntry[] = [];
   const seen = new Set<string>();
 
@@ -325,9 +353,10 @@ export function propertyEntriesFor(resource: Resource, resources: Map<string, Re
   }
 
   for (const quad of resource.outgoing) {
-    if (quad.object.termType === 'Literal'
+    if (!isAttributePredicate(quad.predicate.value, resources)
+      && quad.object.termType === 'Literal'
       && (quad.predicate.value.startsWith('https://w3id.org/props#')
-        || /(?:property_simple|attribute_simple|quantity_simple)$/i.test(localName(quad.predicate.value)))) {
+        || /(?:property_simple|quantity_simple)$/i.test(localName(quad.predicate.value)))) {
       const name = prettify(localName(quad.predicate.value)
         .replace(/_(?:property|attribute|quantity)_simple$/i, ''));
       const predicateResource = resources.get(quad.predicate.value);
@@ -358,6 +387,7 @@ export function propertyEntriesFor(resource: Resource, resources: Map<string, Re
       continue;
     }
     if (!isResource(quad.object)) continue;
+    if (isAttributePredicate(quad.predicate.value, resources)) continue;
     const target = resources.get(quad.object.value);
     if (!target) continue;
 
@@ -382,6 +412,78 @@ export function propertyEntriesFor(resource: Resource, resources: Map<string, Re
     }
   }
   return entries;
+}
+
+/** Normalizes IFC attributes and folds OPM level 2/3 attribute resources into their owner. */
+export function attributeEntriesFor(resource: Resource, resources: Map<string, Resource>): PropertyEntry[] {
+  const entries: PropertyEntry[] = [];
+  for (const quad of resource.outgoing) {
+    if (!isAttributePredicate(quad.predicate.value, resources)) continue;
+    const name = prettify(localName(quad.predicate.value).replace(/_attribute_simple$/i, '').replace(/Ifc\w*$/i, ''));
+    if (quad.object.termType === 'Literal') {
+      entries.push({
+        id: `${resource.id}-${quad.predicate.value}-attribute`,
+        name,
+        value: quad.object.value,
+        datatype: quad.object.datatype ? localName(quad.object.datatype.value) : undefined,
+        level: 1,
+      });
+      continue;
+    }
+    if (!isResource(quad.object)) continue;
+    const attribute = resources.get(quad.object.value);
+    if (!attribute) continue;
+    const entry = opmPropertyEntry(attribute, quad.predicate.value, resources);
+    if (entry) entries.push({ ...entry, name });
+  }
+  return entries;
+}
+
+function materializePropertySetGroups(resources: Map<string, Resource>, quads: Quad[]) {
+  const owners = [...resources.values()].filter((resource) =>
+    !isPropertySetResource(resource)
+    && !resource.types.some((type) => type === `${OPM}Property` || type === `${OPM}CurrentPropertyState`));
+
+  for (const owner of owners) {
+    const entries = propertyEntriesFor(owner, resources).filter((entry) => entry.setName);
+    if (!entries.length) continue;
+    const explicitSetNames = new Set(owner.outgoing.flatMap((quad) => {
+      if (!isResource(quad.object)) return [];
+      const target = resources.get(quad.object.value);
+      return target && isPropertySetResource(target) ? [target.label] : [];
+    }));
+    const groups = new Map<string, PropertyEntry[]>();
+    for (const entry of entries) {
+      const setName = entry.setName!;
+      if (explicitSetNames.has(setName)) continue;
+      const group = groups.get(setName) ?? [];
+      group.push(entry);
+      groups.set(setName, group);
+    }
+
+    for (const [setName, propertyEntries] of groups) {
+      const id = `urn:lbd-browser:property-set:${encodeURIComponent(owner.id)}:${encodeURIComponent(setName)}`;
+      const link = DataFactory.quad(
+        DataFactory.namedNode(owner.id),
+        DataFactory.namedNode(`${BSDD_META}hasPropertySet`),
+        DataFactory.namedNode(id),
+      );
+      const propertySet: Resource = {
+        id,
+        types: [`${BSDD_META}PropertySet`],
+        label: setName,
+        outgoing: [],
+        incoming: [link],
+        properties: [],
+        propertySet: true,
+        virtualPropertySet: true,
+        propertyEntries,
+      };
+      resources.set(id, propertySet);
+      owner.outgoing.push(link);
+      quads.push(link);
+    }
+  }
 }
 
 export function isBuildingElementResource(resource: Resource): boolean {
@@ -424,6 +526,7 @@ export function expansionConnectedIds(
   const addConnection = (quad: Quad, neighbor: string) => {
     const predicate = quad.predicate.value;
     if (collapsePropertySetContents && /^containsProperty$/i.test(localName(predicate))) return;
+    if (filter === 'properties' && isAttributePredicate(predicate, resources)) return;
     if (!resources.has(neighbor) || !matchesQuadLinkFilter(quad, resources, filter)) return;
     const neighbors = byPredicate.get(predicate) ?? new Set<string>();
     neighbors.add(neighbor);
@@ -439,14 +542,23 @@ export function expansionConnectedIds(
     addConnection(quad, quad.subject.value);
   }
 
-  const connected = collapsePropertySetContents
+  const connected = filter === 'properties'
     ? new Set([...byPredicate.values()].flatMap((neighbors) => [...neighbors]))
     : connectedIds(id, resources, filter);
   const propertySets = propertySetConnectionIds(id, resources);
+  if (filter === 'all') return connected;
   const graphConnections = filter === 'properties'
     ? connected
     : new Set([...connected].filter((neighbor) => !propertySets.has(neighbor)));
-  if (filter === 'properties' && propertySets.size) return propertySets;
+  if (filter === 'properties' && propertySets.size) {
+    const result = new Set(propertySets);
+    for (const [predicate, neighbors] of byPredicate) {
+      if (isNavigationBackbone(predicate)) {
+        for (const neighbor of neighbors) result.add(neighbor);
+      }
+    }
+    return result;
+  }
   if (filter === 'geometry') return graphConnections;
   if (filter === 'topology') {
     const storeys = new Set<string>();
